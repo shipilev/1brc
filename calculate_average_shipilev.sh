@@ -16,9 +16,13 @@
 #
 
 
-JAVA_OPTS="-XX:+UseParallelGC -Xms3g -Xmx3g -Xmn2g"
+JAVA_OPTS="-XX:+UseParallelGC -Xms1g -Xmx1g -XX:-TieredCompilation"
 
 # Profiling
 #JAVA_OPTS="$JAVA_OPTS -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -agentpath:/home/shade/trunks/shipilev-async-profiler/build/libasyncProfiler.so=start,event=cpu,file=/home/shade/Desktop/profile.html"
 
-time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_shipilev
+#JAVA_OPTS="$JAVA_OPTS -XX:+PrintCompilation"
+#JAVA_OPTS="$JAVA_OPTS -Xlog:gc"
+
+#time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_shipilev
+perf stat -r 5 java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_shipilev

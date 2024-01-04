@@ -15,91 +15,115 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Field;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.*;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RecursiveTask;
 
 public class CalculateAverage_shipilev {
 
     private static final String FILE = "./measurements.txt";
 
-    private static final int MAP_SIZE = 2048;
-    private static final int MAP_SIZE_MASK = MAP_SIZE - 1;
-
-    private static final int CHUNK_SIZE = 1 * 1024 * 1024;
+    private static final int MMAP_CHUNK_SIZE = 128 * 1024 * 1024;
+    private static final int BYTE_CHUNK_SIZE = 1 * 1024 * 1024;
 
     // Quick and dirty open-address hashmap
     private static class MeasurementsMap {
+        private static final int MAP_SIZE = 2048;
+        private static final int MAP_SIZE_MASK = MAP_SIZE - 1;
+
         private final Bucket[] map;
 
         public MeasurementsMap() {
             map = new Bucket[MAP_SIZE];
         }
 
-        public void add(byte[] name, int temp) {
-            int hash = Arrays.hashCode(name);
-            int idx = hash & MAP_SIZE_MASK;
+        private int hashCode(byte[] bs, int begin, int end) {
+            int hc = 1;
+            for (int i = begin; i < end; i++) {
+                hc = hc * 31 + bs[i];
+            }
+            return hc;
+        }
+
+        public void add(byte[] name, int nameBegin, int nameEnd, int temp) {
+            int hash = hashCode(name, nameBegin, nameEnd);
+            int origIdx = hash & MAP_SIZE_MASK;
+            int idx = origIdx;
 
             while (true) {
-                Bucket curStat = map[idx];
-                if (curStat == null) {
+                Bucket cur = map[idx];
+                if (cur == null) {
                     // No bucket yet
-                    map[idx] = curStat = new Bucket(name, hash);
-                    curStat.merge(temp);
+                    map[idx] = cur = new Bucket(Arrays.copyOfRange(name, nameBegin, nameEnd), hash);
+                    cur.merge(temp);
                     return;
                 }
-                else if (curStat.rawNameHash == hash &&
-                        Arrays.equals(curStat.rawName, name)) {
+                else if (cur.rawNameHash == hash &&
+                        Arrays.equals(cur.rawName, 0, cur.rawName.length, name, nameBegin, nameEnd)) {
                     // Hit!
-                    curStat.merge(temp);
+                    cur.merge(temp);
                     return;
                 }
                 else {
                     // Keep searching
                     idx = (idx + 1) & MAP_SIZE_MASK;
+                    if (idx == origIdx) {
+                        // TODO: Rehash.
+                        throw new IllegalStateException("Not implemented");
+                    }
                 }
             }
         }
 
-        public void merge(MeasurementsMap other) {
-            for (Bucket otherStats : other.map) {
-                if (otherStats == null)
+        public void merge(MeasurementsMap otherMap) {
+            for (Bucket other : otherMap.map) {
+                if (other == null)
                     continue;
-                int idx = otherStats.rawNameHash & MAP_SIZE_MASK;
+                int origIdx = other.rawNameHash & MAP_SIZE_MASK;
+                int idx = origIdx;
                 while (true) {
-                    Bucket curStat = map[idx];
-                    if (curStat == null) {
+                    Bucket cur = map[idx];
+                    if (cur == null) {
                         // No bucket yet
-                        map[idx] = otherStats;
+                        map[idx] = other;
                         break;
                     }
-                    else if (curStat.rawNameHash == otherStats.rawNameHash &&
-                            Arrays.equals(curStat.rawName, otherStats.rawName)) {
+                    else if (cur.rawNameHash == other.rawNameHash &&
+                            Arrays.equals(cur.rawName, other.rawName)) {
                         // Hit!
-                        curStat.merge(otherStats);
+                        cur.merge(other);
                         break;
                     }
                     else {
                         // Keep searching
                         idx = (idx + 1) & MAP_SIZE_MASK;
+                        if (idx == origIdx) {
+                            // TODO: Rehash.
+                            throw new IllegalStateException("Not implemented");
+                        }
                     }
                 }
             }
         }
 
-        private static double round(double value) {
+        private static double convert(double value) {
             return Math.round(value * 10.0) / 100.0;
         }
 
         public void print(PrintStream ps) {
             Arrays.sort(map, (o1, o2) -> {
+                // Squeeze nulls on one side.
+                if (o1 == null && o2 == null)
+                    return 0;
                 if (o1 == null)
-                    return -1; // YOLO
+                    return -1;
                 if (o2 == null)
                     return 1;
                 return o1.stringName().compareTo(o2.stringName());
@@ -119,11 +143,11 @@ public class CalculateAverage_shipilev {
                 }
                 ps.print(stats.stringName());
                 ps.print("=");
-                ps.print(round(stats.min));
+                ps.print(convert(stats.min));
                 ps.print("/");
-                ps.print(round(stats.sum / stats.count));
+                ps.print(convert(stats.sum / stats.count));
                 ps.print("/");
-                ps.print(round(stats.max));
+                ps.print(convert(stats.max));
             }
             ps.print("}");
         }
@@ -166,87 +190,58 @@ public class CalculateAverage_shipilev {
         }
     }
 
-    public static class ProcessingTask extends RecursiveTask<MeasurementsMap> {
-        private final FileChannel fc;
-        private final long taskStart;
-        private final long taskSize;
+    public static class ProcessingTask extends WrapperTask {
+        private static final ThreadLocal<byte[]> BUFFERS = ThreadLocal.withInitial(() -> new byte[BYTE_CHUNK_SIZE]);
 
-        public ProcessingTask(FileChannel fc, long taskStart, long taskSize) {
-            this.fc = fc;
-            this.taskStart = taskStart;
-            this.taskSize = taskSize;
+        private final MappedByteBuffer buf;
+        private final int taskStart;
+        private final int taskSize;
+
+        public ProcessingTask(MappedByteBuffer buf, int start, int size) {
+            this.buf = buf;
+            this.taskStart = start;
+            this.taskSize = size;
         }
 
         @Override
-        protected MeasurementsMap compute() {
-            try {
-                if (taskSize <= CHUNK_SIZE) {
-                    return internalCompute();
-                }
-                else {
-                    return split();
-                }
+        protected MeasurementsMap internalCompute() throws Exception {
+            if (taskSize > BYTE_CHUNK_SIZE) {
+                return split();
             }
-            catch (Exception e) {
-                throw new IllegalStateException("Internal error", e); // YOLO
+            else {
+                return seqCompute();
             }
         }
 
-        // TODO: This could actually be generic, if we track where the decimal point is.
-        private int parseCentigrade(byte[] src, int start, int end) {
+        private int parseCentigrades(byte[] src, int start, int end) {
             int temp = 0;
-            boolean negative = false;
-            for (int c = start; c < end; c++) {
+            int n = 1;
+            if (src[start] == '-') {
+                n = -1;
+                start++;
+            }
+            for (int c = start; c <= end; c++) {
                 byte b = src[c];
-                if (b == '-') {
-                    negative = true;
-                    continue;
-                }
                 if (b == '.') {
+                    // Parse one more digit and exit.
+                    end = c + 1;
                     continue;
                 }
                 int digit = b - '0';
                 temp = temp * 10 + digit;
             }
-            if (negative) {
-                return -temp;
-            }
-            else {
-                return temp;
-            }
+            return temp * n;
         }
 
-        public static class ByteArraysPool {
-            private static final ConcurrentLinkedQueue<byte[]> QS = new ConcurrentLinkedQueue<>();
-
-            public static byte[] acquire() {
-                byte[] bs = QS.poll();
-                if (bs != null) {
-                    return bs;
-                }
-
-                return new byte[CHUNK_SIZE];
-            }
-
-            public static void release(byte[] bs) {
-                QS.add(bs);
-            }
-        }
-
-        private MeasurementsMap internalCompute() throws IOException {
-            MappedByteBuffer buf = fc.map(FileChannel.MapMode.READ_ONLY, taskStart, taskSize);
-
-            int size = (int) taskSize;
-
+        private MeasurementsMap seqCompute() throws IOException {
             MeasurementsMap map = new MeasurementsMap();
 
             // Read the entire buffer into array: avoid range checks on buffer access.
-            // TODO: Can do Unsafe here to avoid bounds-checks on byte[] as well.
-            byte[] byteBuf = ByteArraysPool.acquire();
-            buf.get(byteBuf, 0, size);
+            byte[] byteBuf = BUFFERS.get();
+            buf.get(taskStart, byteBuf, 0, taskSize);
 
             int idx = 0;
-            while (idx < size) {
+            while (idx < taskSize) {
                 int nameBegin = idx;
                 idx += 3; // We know the name is at least 3 characters
                 while (byteBuf[idx] != ';') {
@@ -264,25 +259,53 @@ public class CalculateAverage_shipilev {
                 // Eat the EOL
                 idx++;
 
-                byte[] name = Arrays.copyOfRange(byteBuf, nameBegin, nameEnd);
-                int temp = parseCentigrade(byteBuf, tempBegin, tempEnd);
+                int temp = parseCentigrades(byteBuf, tempBegin, tempEnd);
 
-                map.add(name, temp);
+                map.add(byteBuf, nameBegin, nameEnd, temp);
             }
-
-            ByteArraysPool.release(byteBuf);
 
             return map;
         }
 
         private MeasurementsMap split() throws IOException {
-            Collection<ProcessingTask> pts = new ArrayList<>();
-
-            long start = taskStart;
-            long hardEnd = taskStart + taskSize;
+            int start = taskStart;
+            int hardEnd = taskStart + taskSize;
 
             while (true) {
-                long end = Math.min(start + CHUNK_SIZE, hardEnd);
+                int end = Math.min(start + BYTE_CHUNK_SIZE, hardEnd);
+                if (start >= end) {
+                    break;
+                }
+
+                // Do not split the line.
+                while (buf.get(end - 1) != '\n') {
+                    end--;
+                }
+
+                // Fork out
+                int size = (end - start);
+                forkOut(new ProcessingTask(buf, start, size));
+                start += size;
+            }
+
+            return joinAll();
+        }
+    }
+
+    public static class MmapSplitTask extends WrapperTask {
+        private final FileChannel fc;
+
+        public MmapSplitTask(FileChannel fc) {
+            this.fc = fc;
+        }
+
+        @Override
+        protected MeasurementsMap internalCompute() throws IOException {
+            long start = 0;
+            long hardEnd = fc.size();
+
+            while (true) {
+                long end = Math.min(start + MMAP_CHUNK_SIZE, hardEnd);
                 if (start >= end) {
                     break;
                 }
@@ -296,26 +319,76 @@ public class CalculateAverage_shipilev {
                     size--;
                 }
 
-                // Fork out
-                ProcessingTask pt = new ProcessingTask(fc, start, size);
-                pt.fork();
-                pts.add(pt);
+                forkOut(new ProcessingTask(buf, 0, size));
                 start += size;
             }
 
-            // Aggregate the subtasks
+            return joinAll();
+        }
+    }
+
+    public static abstract class WrapperTask extends RecursiveTask<MeasurementsMap> {
+        private final ArrayList<WrapperTask> wts = new ArrayList<>();
+
+        @Override
+        protected MeasurementsMap compute() {
+            try {
+                return internalCompute();
+            }
+            catch (Exception e) {
+                throw new IllegalStateException("Internal error", e); // YOLO
+            }
+        }
+
+        protected void forkOut(WrapperTask t) {
+            t.fork();
+            wts.add(t);
+        }
+
+        protected MeasurementsMap joinAll() {
             MeasurementsMap map = new MeasurementsMap();
-            for (ProcessingTask pt : pts) {
-                map.merge(pt.join());
+            for (WrapperTask wt : wts) {
+                map.merge(wt.join());
             }
             return map;
         }
+
+        protected abstract MeasurementsMap internalCompute() throws Exception;
+    }
+
+    public static class UnsafeArray {
+        private static final Unsafe U;
+        public static final long SCALE;
+        public static final long BASE;
+
+        static {
+            try {
+                Field f = Unsafe.class.getDeclaredField("theUnsafe");
+                f.setAccessible(true);
+                U = (Unsafe) f.get(null);
+                BASE = U.arrayBaseOffset(byte[].class);
+                SCALE = U.arrayIndexScale(byte[].class);
+
+            }
+            catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        public static byte get(byte[] b, int idx) {
+            return U.getByte(b, BASE + idx * SCALE);
+        }
+
+        public static int getPrefix(byte[] b) {
+            return U.getByte(b, BASE);
+        }
+
     }
 
     public static void main(String[] args) throws IOException {
         try (RandomAccessFile file = new RandomAccessFile(FILE, "r");
                 FileChannel fc = file.getChannel()) {
-            MeasurementsMap map = new ProcessingTask(fc, 0, fc.size()).invoke();
+            MeasurementsMap map = new MmapSplitTask(fc).invoke();
             map.print(System.out);
         }
     }

@@ -21,9 +21,10 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.StringReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 public class CreateMeasurements3 {
@@ -46,21 +47,61 @@ public class CreateMeasurements3 {
             System.exit(1);
         }
         final var weatherStations = generateWeatherStations();
-        final var start = System.currentTimeMillis();
-        final var rnd = ThreadLocalRandom.current();
-        try (var out = new BufferedWriter(new FileWriter("measurements3.txt"))) {
-            for (int i = 1; i <= size; i++) {
-                var station = weatherStations.get(rnd.nextInt(KEYSET_SIZE));
-                double temp = rnd.nextGaussian(station.avgTemp, 7.0);
-                out.write(station.name);
-                out.write(';');
-                out.write(Double.toString(Math.round(temp * 10.0) / 10.0));
-                out.newLine();
-                if (i % 50_000_000 == 0) {
-                    System.out.printf("Wrote %,d measurements in %,d ms%n", i, System.currentTimeMillis() - start);
+
+        List<ByteBuffer> arrays = new ArrayList<>();
+        for (WeatherStation s : weatherStations) {
+            byte[] utf8 = StandardCharsets.UTF_8.encode(s.name() + ";0.0").array();
+            arrays.add(ByteBuffer.wrap(utf8).order(ByteOrder.LITTLE_ENDIAN));
+        }
+
+        final int SIZE = 1 << 15;
+        Integer[] hashes = new Integer[SIZE];
+
+        int[] collisions = new int[SIZE];
+
+        for (int p1 = 0; p1 < 128 * 1024; p1++) {
+
+            Arrays.fill(hashes, null);
+            Arrays.fill(collisions, 0);
+
+            for (ByteBuffer b : arrays) {
+                Integer hc = hashCode1(b, p1);
+
+                int coll = 0;
+                for (; coll < SIZE; coll++) {
+                    if (hashes[(hc + coll) & (SIZE - 1)] == null) {
+                        hashes[(hc + coll) & (SIZE - 1)] = hc;
+                        collisions[coll]++;
+                        break;
+                    }
                 }
             }
+            // if (weatherStations.size() - colls.size() < 100) {
+            System.out.printf(" %5d, %5d, %5d, %5d, %5d, %5d, %5d, %5d%n",
+                    p1,
+                    collisions[0], collisions[1], collisions[2], collisions[3], collisions[4], collisions[5], collisions[6]);
+            // }
         }
+    }
+
+    private static int hashCode1(ByteBuffer slice, int p1) {
+        int idx = 0;
+        int nameBegin = idx;
+        int nameHash1 = 0;
+
+        outer: while (true) {
+            int intName = slice.getInt(idx);
+            for (int c = 0; c < 4; c++) {
+                int b = (int) (intName >> (c << 3) & 0xFF);
+                if (b == ';') {
+                    idx += c + 1;
+                    break outer;
+                }
+                nameHash1 ^= b * p1;
+            }
+            idx += 4;
+        }
+        return nameHash1;
     }
 
     record WeatherStation(String name, float avgTemp) {
